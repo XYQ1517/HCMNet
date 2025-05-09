@@ -1,6 +1,3 @@
-"""
-Codes of LinkNet based on https://github.com/snakers4/spacenet-three
-"""
 import torch
 import torch.nn as nn
 from torchvision import models
@@ -16,6 +13,9 @@ from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_
 from einops import rearrange, repeat
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import fvcore.nn.weight_init as weight_init
+from functools import partial
+from timm.models.helpers import named_apply
+from timm.models.layers import trunc_normal_tf_
 nonlinearity = partial(F.relu, inplace=True)
 
 
@@ -73,56 +73,40 @@ class DWT_2D(nn.Module):
         return DWT_Function.apply(x, self.w_ll, self.w_lh, self.w_hl, self.w_hh)
 
 
-class Dblock(nn.Module):
-    def __init__(self,channel):
-        super(Dblock, self).__init__()
-        self.dilate1 = nn.Conv2d(channel, channel, kernel_size=3, dilation=1, padding=1)
-        self.dilate2 = nn.Conv2d(channel, channel, kernel_size=3, dilation=2, padding=2)
-        self.dilate3 = nn.Conv2d(channel, channel, kernel_size=3, dilation=4, padding=4)
-        self.dilate4 = nn.Conv2d(channel, channel, kernel_size=3, dilation=8, padding=8)
-        #self.dilate5 = nn.Conv2d(channel, channel, kernel_size=3, dilation=16, padding=16)
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-                if m.bias is not None:
-                    m.bias.data.zero_()
-                    
-    def forward(self, x):
-        dilate1_out = nonlinearity(self.dilate1(x))
-        dilate2_out = nonlinearity(self.dilate2(dilate1_out))
-        dilate3_out = nonlinearity(self.dilate3(dilate2_out))
-        dilate4_out = nonlinearity(self.dilate4(dilate3_out))
-        #dilate5_out = nonlinearity(self.dilate5(dilate4_out))
-        out = x + dilate1_out + dilate2_out + dilate3_out + dilate4_out# + dilate5_out
-        return out
+def channel_shuffle(x, groups):
+    batchsize, num_channels, height, width = x.data.size()
+    channels_per_group = num_channels // groups    
+    # reshape
+    x = x.view(batchsize, groups, 
+               channels_per_group, height, width)
+    x = torch.transpose(x, 1, 2).contiguous()
+    # flatten
+    x = x.view(batchsize, -1, height, width)
+    return x
+
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_chanels, head_in_channel=256):
+    def __init__(self, in_channels, out_chanels):
         super(DecoderBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, in_channels // 4, 1)
-        self.norm1 = nn.BatchNorm2d(in_channels // 4)
-        self.relu1 = nonlinearity
+        self.mamba = IMamba(in_c=in_channels)
 
-        self.deconv2 = nn.ConvTranspose2d(in_channels // 4, in_channels // 4, 3, stride=2, padding=1, output_padding=1)
-        self.norm2 = nn.BatchNorm2d(in_channels // 4)
-        self.relu2 = nonlinearity
-
-        self.conv3 = nn.Conv2d(in_channels // 4, out_chanels, 1)
-        self.norm3 = nn.BatchNorm2d(out_chanels)
-        self.relu3 = nonlinearity
-
-        self.mamba = MambaBlock(in_c=out_chanels)
+        self.in_channels = in_channels
+        self.out_channels = out_chanels
+        self.up_dwc = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, stride=1, padding=1, groups=self.in_channels, bias=False),
+	        nn.BatchNorm2d(self.in_channels),
+            nn.GELU()
+        )
+        self.pwc = nn.Sequential(
+            nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, stride=1, padding=0, bias=True)
+        ) 
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.norm1(x)
-        x = self.relu1(x)
-        x = self.deconv2(x)
-        x = self.norm2(x)
-        x = self.relu2(x)
-        x = self.conv3(x)
-        x = self.norm3(x)
-        x = self.relu3(x)
         x = self.mamba(x)
+        x = self.up_dwc(x)
+        x = channel_shuffle(x, self.in_channels)
+        x = self.pwc(x)
         return x
 
 
@@ -188,35 +172,32 @@ def logsumexp_2d(tensor):
     outputs = s + (tensor_flatten - s).exp().sum(dim=2, keepdim=True).log()
     return outputs
 
-class ChannelPool(nn.Module):
-    def forward(self, x):
-        return torch.cat( (torch.max(x,1)[0].unsqueeze(1), torch.mean(x,1).unsqueeze(1)), dim=1 )
 
-class SpatialGate(nn.Module):
-    def __init__(self):
-        super(SpatialGate, self).__init__()
-        kernel_size = 7
-        self.compress = ChannelPool()
-        self.spatial = BasicConv(2, 1, kernel_size, stride=1, padding=(kernel_size-1) // 2, relu=False)
-    def forward(self, x):
-        x_compress = self.compress(x)
-        x_out = self.spatial(x_compress)
-        scale = F.sigmoid(x_out) # broadcasting
-        return x * scale
-
-class CBAM(nn.Module):
-    def __init__(self, gate_channels, reduction_ratio=16, pool_types=['avg', 'max'], no_spatial=False):
-        super(CBAM, self).__init__()
-        self.ChannelGate = ChannelGate(gate_channels, reduction_ratio, pool_types)
-        self.no_spatial=no_spatial
-        if not no_spatial:
-            self.SpatialGate = SpatialGate()
-    def forward(self, x):
-        x_out = self.ChannelGate(x)
-        if not self.no_spatial:
-            x_out = self.SpatialGate(x_out)
-        return x_out
-
+# class make_wavelet(nn.Module):
+#     def __init__(self, channels):
+#         super(make_wavelet, self).__init__()
+#         self.channels = channels
+#         self.dwt = DWT_2D(wave='haar')
+#         conv_layers = []
+#         for i in range(len(self.channels)-1):
+#             if i==0:
+#                 conv = nn.Conv2d(self.channels[i], self.channels[i+1] // 4, kernel_size=3, padding=1)
+#                 conv_layers.append(conv)
+#             else:
+#                 conv = nn.Conv2d(self.channels[i] // 4, self.channels[i+1] // 4, kernel_size=3, padding=1)
+#                 conv_layers.append(conv)
+#         self.conv_layers = nn.ModuleList(conv_layers)
+        
+#     def forward(self, x):
+#         output = []
+#         for i in range(len(self.channels)):
+#             if i==0:
+#                 out, x = self.dwt(x)
+#             else:
+#                 x = self.conv_layers[i-1](x)
+#                 out, x = self.dwt(x)
+#                 output.append(out)
+#         return output
 
 class make_wavelet(nn.Module):
     def __init__(self, channels):
@@ -225,12 +206,8 @@ class make_wavelet(nn.Module):
         self.dwt = DWT_2D(wave='haar')
         conv_layers = []
         for i in range(len(self.channels)-1):
-            if i==0:
-                conv = nn.Conv2d(self.channels[i], self.channels[i+1] // 4, kernel_size=3, padding=1)
-                conv_layers.append(conv)
-            else:
-                conv = nn.Conv2d(self.channels[i] // 4, self.channels[i+1] // 4, kernel_size=3, padding=1)
-                conv_layers.append(conv)
+            conv = nn.Conv2d(self.channels[0]*4, self.channels[i+1], kernel_size=3, padding=1)
+            conv_layers.append(conv)
         self.conv_layers = nn.ModuleList(conv_layers)
         
     def forward(self, x):
@@ -239,8 +216,8 @@ class make_wavelet(nn.Module):
             if i==0:
                 out, x = self.dwt(x)
             else:
-                x = self.conv_layers[i-1](x)
                 out, x = self.dwt(x)
+                out = self.conv_layers[i-1](out)
                 output.append(out)
         return output
 
@@ -523,7 +500,7 @@ class FFN(nn.Module):
         return x.permute(0, 3, 1, 2)
 
 
-class MambaBlock(nn.Module):
+class IMamba(nn.Module):
     def __init__(self, in_c, k_size = 3, mlp_ratio=4., drop=0., norm_layer=nn.LayerNorm):
         super().__init__()
         self.in_c = in_c
@@ -547,7 +524,70 @@ class MambaBlock(nn.Module):
         x2 = self.FFN(x2_n)
         x2 = x2 + x1 
         return x2
+    
 
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super(SpatialAttention, self).__init__()
+        self.sa = nn.Conv2d(2, 1, 7, padding=3, padding_mode='reflect', bias=True)
+
+    def forward(self, x):
+        x_avg = torch.mean(x, dim=1, keepdim=True)
+        x_max, _ = torch.max(x, dim=1, keepdim=True)
+        x2 = torch.cat([x_avg, x_max], dim=1)
+        sattn = self.sa(x2)
+        return sattn
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, dim, reduction=8):
+        super(ChannelAttention, self).__init__()
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.ca = nn.Sequential(
+            nn.Conv2d(dim, dim // reduction, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim // reduction, dim, 1, padding=0, bias=True),
+        )
+
+    def forward(self, x):
+        x_gap = self.gap(x)
+        cattn = self.ca(x_gap)
+        return cattn
+
+
+class ChannelShuffle(nn.Module):
+    def __init__(self, dim):
+        super(ChannelShuffle, self).__init__()
+
+    def forward(self, x, pattn1):
+        B, C, H, W = x.shape
+        x = x.unsqueeze(dim=2) # B, C, 1, H, W
+        pattn1 = pattn1.unsqueeze(dim=2) # B, C, 1, H, W
+        x2 = torch.cat([x, pattn1], dim=2) # B, C, 2, H, W
+        x2 = rearrange(x2, 'b c t h w -> b (c t) h w')
+        return x2
+
+
+# Adaptive feature fusion module
+class AFFM(nn.Module):
+    def __init__(self, dim, reduction=8):
+        super(AFFM, self).__init__()
+        self.dim = dim
+        self.sa = SpatialAttention()
+        self.ca = ChannelAttention(dim, reduction)
+        self.CS = ChannelShuffle(dim)
+        self.conv = nn.Conv2d(dim, dim, 1, bias=True)
+
+    def forward(self, x, y):
+        initial = x + y
+        cattn = self.ca(initial)
+        sattn = self.sa(initial)
+        pattn1 = sattn + cattn
+        pattn2 = F.softmax(self.CS(initial, pattn1), dim=1)
+        result = initial + pattn2[:, 0:self.dim, :, :] * x + pattn2[:, self.dim:, :, :] * y
+        result = self.conv(result)
+        return result
+    
 
 class HCMNet(nn.Module):
     def __init__(self, num_classes=1, head_in_channel=256):
@@ -568,25 +608,21 @@ class HCMNet(nn.Module):
         self.encoder4 = resnet.layer4
 
         """Skip connection"""
-        self.s1 = CBAM(gate_channels = 64)
-        self.s2 = CBAM(gate_channels = 128)
-        self.s3 = CBAM(gate_channels = 256)
-        self.s4 = CBAM(gate_channels = 512)
+        self.affm1 = AFFM(dim = 64)
+        self.affm2 = AFFM(dim = 128)
+        self.affm3 = AFFM(dim = 256)
+        self.affm4 = AFFM(dim = 512)
 
         """Decoder"""
-        self.decoder4 = DecoderBlock(self.filters[4], self.filters[3], head_in_channel)
-        self.decoder3 = DecoderBlock(self.filters[3], self.filters[2], head_in_channel)
-        self.decoder2 = DecoderBlock(self.filters[2], self.filters[1], head_in_channel)
-        self.decoder1 = DecoderBlock(self.filters[1], self.filters[1], head_in_channel)
+        self.decoder4 = DecoderBlock(self.filters[4], self.filters[3])
+        self.decoder3 = DecoderBlock(self.filters[3], self.filters[2])
+        self.decoder2 = DecoderBlock(self.filters[2], self.filters[1])
+        self.decoder1 = DecoderBlock(self.filters[1], self.filters[1])
 
-        self.finaldeconv1 = nn.ConvTranspose2d(self.filters[1], 32, 4, 2, 1)
-        self.finalrelu1 = nonlinearity
-        self.finalconv2 = nn.Conv2d(32, 32, 3, padding=1)
-        self.finalrelu2 = nonlinearity
-        self.finalconv3 = nn.Conv2d(32, num_classes, 3, padding=1)
+        self.out_head = nn.Conv2d(self.filters[1], num_classes, 1)
 
     def forward(self, x):
-        # edge_features
+        # # edge_features
         edge_features = self.make_wavelet(x)
 
         # Encoder
@@ -598,36 +634,38 @@ class HCMNet(nn.Module):
         e2 = self.encoder2(e1)
         e3 = self.encoder3(e2)
         e4 = self.encoder4(e3)
-        
+
+        # e1 = e1 + edge_features[0]
+        # e2 = e2 + edge_features[1]
+        # e3 = e3 + edge_features[2]
+        # e4 = e4 + edge_features[3]
+
         # Skip connection
-        e1 = self.s1(e1 + edge_features[0])
-        e2 = self.s2(e2 + edge_features[1])
-        e3 = self.s3(e3 + edge_features[2])
-        e4 = self.s4(e4 + edge_features[3])
+        e1 = self.affm1(e1, edge_features[0])
+        e2 = self.affm2(e2, edge_features[1])
+        e3 = self.affm3(e3, edge_features[2])
+        e4 = self.affm4(e4, edge_features[3])
 
         # Decoder
         d4 = self.decoder4(e4)
         d3 = self.decoder3(d4 + e3)
         d2 = self.decoder2(d3 + e2)
         d1 = self.decoder1(d2 + e1)
-        
-        out = self.finaldeconv1(d1)
-        out = self.finalrelu1(out)
-        out = self.finalconv2(out)
-        out = self.finalrelu2(out)
-        out = self.finalconv3(out)
+
+        out = self.out_head(d1)
+        out = F.interpolate(out, scale_factor=2, mode='bilinear')
         return F.sigmoid(out)
 
 
-
-if __name__ == "__main__":
-    x = torch.randn((1, 3, 512, 512)).to("cuda:1")
-    model = HCMNet().to("cuda:1")
-    y = model(x)
-    print(y.shape)
+if __name__ == '__main__':
     from thop import profile
     from thop import clever_format
+    x = torch.randn((1, 3, 512, 512)).to("cuda:0")
+    model = HCMNet().to("cuda:0")
+    y = model(x)
+    print(y.shape)
+
     MACs, Params = profile(model, inputs=(x,), verbose=False)
-    MACs, Params = clever_format([MACs, Params], '%.2f')
-    print(f"MACs:{MACs}")
+    Flops, Params = clever_format([MACs * 2, Params], '%.2f')
+    print(f"Flops:{Flops}")
     print(f"Params:{Params}")

@@ -13,17 +13,7 @@ from utils.saver import Saver
 from utils.summaries import TensorboardSummary
 from utils.metrics import Evaluator
 from modeling.unet import Unet
-from modeling.CENet import CE_Net
-from modeling.DconnNet import DconnNet
-from modeling.FATNet import FAT_Net
-from modeling.MEGANet import MEGANet
-from modeling.CPFNet import CPFNet
-from modeling.AC_MambaSeg import AC_MambaSeg
-from modeling.H_vmunet import H_vmunet
-from modeling.BWMamba import BWMamba
 from modeling.HCMNet import HCMNet
-from modeling.VMUNet import VMUNet
-from modeling.VMUNetv2 import VMUNetV2
 # os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 
@@ -44,8 +34,8 @@ class Trainer(object):
         self.train_loader, self.val_loader, self.test_loader = self.train_loader_list[2], self.val_loader_list[2], self.test_loader_list[2]
 
         # Define network
-        model = VMUNetV2()
-        model.load_from()
+        model = HCMNet()
+        # model.load_from()
 
         # Define Optimizer
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -256,7 +246,7 @@ def main():
                         metavar='N', help='input batch size for \
                                 training (default: 8)')
     # optimizer params
-    parser.add_argument('--lr', type=float, default=5.8e-4, metavar='LR',
+    parser.add_argument('--lr', type=float, default=5e-4, metavar='LR',
                         choices=[5e-4, 3e-4, 2e-4])
     parser.add_argument('--lr-scheduler', type=str, default='cos',
                         choices=['loss_lr_1', 'poly', 'step', 'cos'])
@@ -297,7 +287,7 @@ def main():
             raise ValueError('Argument --gpu_ids must bomma-separated list of integers only')
 
     if args.checkname is None:
-        args.checkname = 'VMUNetV2'
+        args.checkname = 'HCMNet'
     print(args)
     torch.manual_seed(args.seed)
     trainer = Trainer(args)

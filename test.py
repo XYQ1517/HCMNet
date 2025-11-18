@@ -6,16 +6,7 @@ from dataloaders import make_data_loader
 from utils.metrics import Evaluator
 from tqdm import tqdm
 from modeling.unet import Unet
-from modeling.CENet import CE_Net
-from modeling.DconnNet import DconnNet
-from modeling.MEGANet import MEGANet
-from modeling.CPFNet import CPFNet
-from modeling.AC_MambaSeg import AC_MambaSeg
-from modeling.H_vmunet import H_vmunet
-from modeling.BWMamba import BWMamba
 from modeling.HCMNet import HCMNet
-from modeling.VMUNet import VMUNet
-from modeling.VMUNetv2 import VMUNetV2
 # os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 
@@ -44,7 +35,7 @@ def main():
                         help='mask image to save')
     parser.add_argument('--batch-size', type=int, default=4,
                         metavar='N', help='input batch size for test ')
-    parser.add_argument('--ckpt', type=str, default='./run/BUSI/VMUNetV2/experiment_20240913_094256/checkpoint.pth.tar',
+    parser.add_argument('--ckpt', type=str, default='./run/BUSI/HCMNet/experiment_20240913_094256/checkpoint.pth.tar',
                         help='saved model')
     parser.add_argument('--out-stride', type=int, default=8,
                         help='network output stride (default: 8)')
@@ -82,11 +73,11 @@ def main():
     train_loader_list, val_loader_list, test_loader_list, nclass = make_data_loader(args, **kwargs)
     train_loader, val_loader, test_loader = train_loader_list[0], val_loader_list[0], test_loader_list[0]
 
-    model = VMUNetV2().to(device)
+    model = HCMNet().to(device)
     ckpt = torch.load(args.ckpt)
     model.load_state_dict(ckpt['state_dict'])
 
-    out_path = os.path.join(args.out_path, 'Output', 'VMUNetV2/')
+    out_path = os.path.join(args.out_path, 'Output', 'HCMNet/')
     if not os.path.exists(out_path):
         os.makedirs(out_path)
 

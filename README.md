@@ -1,11 +1,15 @@
-## 1.下载BUSI等数据集，并按照如下示例存放：
+## 1.下载数据集
+
+下载BUSI等数据集，并按照如下示例存放：
 
     data
     └── BUSI
         ├── images
         └── masks
 
-## 2.利用"./process/trans_BUSI.py"对BUSI数据集进行预处理，得到train.txt、val.txt和test.txt：
+## 2. 数据集预处理
+
+利用"./process/trans_BUSI.py"对BUSI数据集进行预处理，得到train.txt、val.txt和test.txt：
 
     data
     └── BUSI
